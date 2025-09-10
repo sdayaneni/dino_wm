@@ -161,7 +161,24 @@ python plan.py --config-name plan_wall.yaml model_name=wall
 Planning logs and visualizations can be found in `./plan_outputs`.
 
 
-## Citation
+# NCSA Delta Specific Instructions
+
+SLURM scripts contained within `/job_scripts` directory
+
+## Key Environment Variables
+
+```bash
+# Include these in your SLURM scripts
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
+export C_PATH=:$HOME/miniconda3/envs/dino_wm/include
+```
+
+## Troubleshooting
+- If running into problems with Mujoco dependencies, refer to the following GitHub Issues [post](https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28)
+- To view list of working dependencies, refer to `./requirements.txt`
+
+
+# Citation
 
 ```
 @misc{zhou2024dinowmworldmodelspretrained,

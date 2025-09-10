@@ -1,0 +1,24 @@
+#!/bin/bash
+
+#SBATCH --account=beig-delta-gpu
+#SBATCH --partition=gpuA100x4
+
+### NODE/CPU/MEM/GPU  ###
+#SBATCH --mem-bind=verbose,local
+#SBATCH --gpu-bind=verbose,closest
+#SBATCH --mem-per-cpu=4G
+#SBATCH --cpus-per-gpu=16
+#SBATCH --gpus-per-node=1
+#SBATCH --time=08:00:00
+
+### Misc ###
+#SBATCH --ntasks=1
+
+### LOG INFO ###
+#SBATCH --job-name=train_point_maze
+#SBATCH --output=logs/train/point_maze/train_point_maze_%A-%a.log
+
+module purge
+echo "Starting hydra run"
+
+python train.py --config-name train.yaml env=point_maze frameskip=5 num_hist=3
