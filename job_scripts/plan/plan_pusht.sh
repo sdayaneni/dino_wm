@@ -9,21 +9,20 @@
 #SBATCH --mem-per-cpu=4G
 #SBATCH --cpus-per-gpu=16
 #SBATCH --gpus-per-node=1
-#SBATCH --time=48:00:00
+#SBATCH --time=08:00:00
 
 ### Misc ###
 #SBATCH --ntasks=1
 
 ### LOG INFO ###
-#SBATCH --job-name=train_pusht
-#SBATCH --output=logs/train/pusht/train_pusht_%A-%a.log
+#SBATCH --job-name=plan_pusht
+#SBATCH --output=logs/plan/pusht/plan_pusht_%A-%a.log
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/u/sdayaneni/.mujoco/mujoco210/bin
 export C_PATH=:$HOME/miniconda3/envs/dino_wm/include
 export DATASET_DIR=/work/nvme/beig/sdayaneni/datasets
-
 module purge
 echo "Starting hydra run"
 
-python train.py --config-name train.yaml env=pusht frameskip=5 num_hist=3
+python plan.py model_name=2025-09-19/03-32-58 n_evals=10 planner=cem goal_H=5 goal_source='random_state' planner.opt_steps=30 ckpt_base_path=/work/nvme/beig/sdayaneni/dino_wm

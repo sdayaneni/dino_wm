@@ -558,9 +558,11 @@ class Trainer:
             obs, act, state = data
             plot = i == 0
             self.model.eval()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
+
+            with torch.no_grad():
+                z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                    obs, act
+                )
 
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
