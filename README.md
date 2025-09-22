@@ -174,7 +174,7 @@ export C_PATH=:$HOME/miniconda3/envs/dino_wm/include
 ```
 
 ## Troubleshooting
-- If running into problems with Mujoco dependencies, refer to the following GitHub Issues [post](https://osf.io/bmw48/?view_only=a56a296ce3b24cceaf408383a175ce28)
+- If running into problems with Mujoco dependencies, refer to the following GitHub Issues [post](https://github.com/openai/mujoco-py/issues/627)
 - To view list of working dependencies, refer to `./requirements.txt`
 
 
