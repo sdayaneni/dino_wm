@@ -65,35 +65,15 @@ We are using a docker image to compile PyFleX. Make sure you have the following 
 - [docker-ce](https://docs.docker.com/engine/install/ubuntu/)
 - [nvidia-docker](https://github.com/NVIDIA/nvidia-docker#quickstart)
 
-Full installation:
+Full installation **(On NCSA with Apptainer):**
 ```bash
 pip install "pybind11[global]"
-sudo docker pull xingyu/softgym
+apptainer pull docker://xingyu/softgym:latest
 ```
+
+Copy [PyFleX](https://github.com/Boey-li/AdaptiGraph/tree/main/PyFleX) directory to workspace.
+
 Run `bash install_pyflex.sh`. You may need to `source ~/.bashrc` to `import PyFleX`.
-
-Or you can manually run
-```bash
-# compile pyflex in docker image
-# re-compile if source code changed
-# make sure ${PWD}/PyFleX is the pyflex root path when re-compiling
-sudo docker run \
-    -v ${PWD}/PyFleX:/workspace/PyFleX \
-    -v ${CONDA_PREFIX}:/workspace/anaconda \
-    -v /tmp/.X11-unix:/tmp/.X11-unix \
-    --gpus all \
-    -e DISPLAY=$DISPLAY \
-    -e QT_X11_NO_MITSHM=1 \
-    -it xingyu/softgym:latest bash \
-    -c "export PATH=/workspace/anaconda/bin:$PATH; cd /workspace/PyFleX; export PYFLEXROOT=/workspace/PyFleX; export PYTHONPATH=/workspace/PyFleX/bindings/build:$PYTHONPATH; export LD_LIBRARY_PATH=$PYFLEXROOT/external/SDL2-2.0.4/lib/x64:$LD_LIBRARY_PATH; cd bindings; mkdir build; cd build; /usr/bin/cmake ..; make -j"
-
-# import to system paths. run these if you do not have these paths yet in ~/.bashrc
-echo '# PyFleX' >> ~/.bashrc
-echo "export PYFLEXROOT=${PWD}/PyFleX" >> ~/.bashrc
-echo 'export PYTHONPATH=${PYFLEXROOT}/bindings/build:$PYTHONPATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=${PYFLEXROOT}/external/SDL2-2.0.4/lib/x64:$LD_LIBRARY_PATH' >> ~/.bashrc
-echo '' >> ~/.bashrc
-```
 
 # Datasets
 

@@ -194,6 +194,9 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals: (b, t, h, w, c)
         goal: (b, h, w, c)
         """
+        if self.n_plot_samples == 0:
+            return
+            
         e_visuals = e_visuals[: self.n_plot_samples]
         i_visuals = i_visuals[: self.n_plot_samples]
         goal_visual = self.obs_g["visual"][: self.n_plot_samples]

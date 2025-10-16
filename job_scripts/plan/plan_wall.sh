@@ -25,4 +25,4 @@ export DATASET_DIR=/work/nvme/beig/sdayaneni/datasets
 module purge
 echo "Starting hydra run"
 
-python plan.py model_name=2025-09-19/03-40-00 n_evals=10 planner=cem goal_H=5 goal_source='random_state' planner.opt_steps=30 ckpt_base_path=/work/nvme/beig/sdayaneni/dino_wm
+python plan.py --config-name plan_wall model_name=2025-09-21/05-23-38 ckpt_base_path=/work/nvme/beig/sdayaneni/dino_wm

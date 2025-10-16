@@ -26,4 +26,6 @@ export DATASET_DIR=/work/nvme/beig/sdayaneni/datasets
 module purge
 echo "Starting hydra run"
 
-python train.py --config-name train.yaml env=point_maze frameskip=5 num_hist=3
+python train.py --config-name train.yaml env=point_maze frameskip=5 num_hist=3 \
+    hydra.run.dir=/work/nvme/beig/sdayaneni/dino_wm/outputs/2025-09-21/05-22-44 \
+    hydra.sweep.dir=/work/nvme/beig/sdayaneni/dino_wm/outputs/2025-09-21/05-22-44

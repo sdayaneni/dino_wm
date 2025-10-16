@@ -9,20 +9,21 @@
 #SBATCH --mem-per-cpu=4G
 #SBATCH --cpus-per-gpu=16
 #SBATCH --gpus-per-node=1
-#SBATCH --time=08:00:00
+#SBATCH --time=48:00:00
 
 ### Misc ###
 #SBATCH --ntasks=1
 
 ### LOG INFO ###
-#SBATCH --job-name=plan_point_maze
-#SBATCH --output=logs/plan/point_maze/plan_point_maze_%A-%a.log
+#SBATCH --job-name=train_granular
+#SBATCH --output=logs/train/granular/granular%A-%a.log
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/lib/nvidia
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/u/sdayaneni/.mujoco/mujoco210/bin
 export C_PATH=:$HOME/miniconda3/envs/dino_wm/include
 export DATASET_DIR=/work/nvme/beig/sdayaneni/datasets
+
 module purge
 echo "Starting hydra run"
 
-python plan.py --config-name plan_point_maze model_name=2025-09-21/05-22-44 ckpt_base_path=/work/nvme/beig/sdayaneni/dino_wm
+python train.py --config-name train.yaml env=deformable_env frameskip=1 num_hist=1
