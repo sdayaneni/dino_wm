@@ -51,21 +51,21 @@ class EBT(L.LightningModule):
         goal_proprio = goal_states['proprio']    
 
         # Get final timestep
-        pred_visual = predicted_states['visual'][:, -1:, :, :]  # (B, 1, num_patches, emb_dim)
-        pred_proprio = predicted_states['proprio'][:, -1:, :]  # (B, 1, proprio_dim)
+        pred_visual = predicted_states['visual'][:, -1:, :, :]  # (B, 1, T, D)
+        pred_proprio = predicted_states['proprio'][:, -1:, :]
         
-        pred_visual = pred_visual.squeeze(1)  # (B, num_patches, emb_dim)
-        goal_visual = goal_visual.squeeze(1)  # (B, num_patches, emb_dim)
+        pred_visual = pred_visual.squeeze(1)  # (B, T, D)
+        goal_visual = goal_visual.squeeze(1) 
         
-        all_embeddings = torch.cat([pred_visual, goal_visual], dim=1)  # (B, 2*num_patches, emb_dim)
+        all_embeddings = torch.cat([pred_visual, goal_visual], dim=1)  # (B, 2T, D)
 
         B, num_patches, D = all_embeddings.shape
 
         spatial_size = int(total_patches ** 0.5)
         if spatial_size * spatial_size < total_patches:
             spatial_size += 1
-            pad_size = spatial_size * spatial_size - total_patches
-            padding = torch.zeros(B, pad_size, D, device=all_embeddings.device, dtype=all_embeddings.dtype)
+            padding_size = spatial_size * spatial_size - total_patches
+            padding = torch.zeros(B, padding_size, D, device=all_embeddings.device, dtype=all_embeddings.dtype)
             all_embeddings = torch.cat([all_embeddings, padding], dim=1)
         
         spatial_input = all_embeddings.transpose(1, 2).reshape(B, D, spatial_size, spatial_size)
@@ -84,20 +84,28 @@ class EBT(L.LightningModule):
         from models.bi_ebt_adaln import EBT
         assert self.image_dims[0] == self.image_dims[1], "need to use square image with current implementation"
 
-        if hparams.image_task == "denoising":
-            # For denoising task, use raw image dimensions (no VAE)
-            input_size = hparams.image_dims[0]
-            in_channels = 3  # RGB channels for raw images
-        else:
-            # For other tasks using VAE
-            assert self.image_dims[0] % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-            input_size = self.image_dims[0] // 8
-            in_channels = 4
+        dino_encoder = self.world_model.encoder
+        dino_embedding_dim = dino_encoder.emb_dim 
+        dino_patch_size = dino_encoder.patch_size
+        
+        image_size = self.image_dims[0]
+
+        # taken from train.py
+        decoder_scale = 16 
+        num_side_patches = image_size // decoder_scale
+        num_patches_per_image = num_side_patches ** 2
+
+        # pred + goal
+        total_patches = 2 * num_patches_per_image
+        
+        spatial_size = int(total_patches ** 0.5)
+        if spatial_size * spatial_size < total_patches:
+            spatial_size += 1
     
         ebt = EBT(
-            input_size=input_size,
+            input_size=spatial_size,
             patch_size=self.patch_size,
-            in_channels=in_channels,
+            in_channels=dino_embedding_dim,
             hidden_size=self.embedding_dim,
             depth=self.num_transformer_blocks,
             num_heads=self.multiheaded_attention_heads,
