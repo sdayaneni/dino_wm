@@ -130,6 +130,8 @@ class MPCPlanner(BasePlanner):
             )
             self.iter += 1
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
+            
+            torch.cuda.empty_cache()
 
         planned_actions = torch.cat(self.planned_actions, dim=1)
         self.evaluator.assign_init_cond(

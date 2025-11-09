@@ -3,6 +3,7 @@ import numpy as np
 import pyflex
 import gym
 import math
+import threading
 from scipy.spatial.distance import cdist
 
 import pybullet as p
@@ -20,9 +21,21 @@ from ..utils import fps_with_idx, quatFromAxisAngle, find_min_distance, rand_flo
 
 BASE_DIR = os.path.abspath(os.path.join(__file__, "../../../../../../"))
 
+# Global PyFlex state management
+pyflex_lock = threading.Lock()
+pyflex_initialized = False
+pyflex_env_count = 0
+pyflex_config = None
+
 class FlexEnv(gym.Env):
     def __init__(self, config=None) -> None:
+        global pyflex_initialized, pyflex_env_count, pyflex_config
+        
         super().__init__()
+        
+        with pyflex_lock:
+            pyflex_env_count += 1
+            self.env_id = pyflex_env_count
 
         self.dataset_config = config["dataset"]
 
@@ -38,22 +51,41 @@ class FlexEnv(gym.Env):
         self.planeId = p.loadURDF("plane.urdf")
 
         # set up robot arm
-        # xarm6
         self.flex_robot_helper = FlexRobotHelper()
         self.end_idx = self.dataset_config["robot_end_idx"]
         self.num_dofs = self.dataset_config["robot_num_dofs"]
         self.robot_speed_inv = self.dataset_config["robot_speed_inv"]
 
-        # set up pyflex
+        # set up pyflex - only initialize once
         self.screenWidth = self.dataset_config["screenWidth"]
         self.screenHeight = self.dataset_config["screenHeight"]
         self.camera = Camera(self.screenWidth, self.screenHeight)
 
-        pyflex.set_screenWidth(self.screenWidth)
-        pyflex.set_screenHeight(self.screenHeight)
-        pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
-        pyflex.set_light_fov(70.0)
-        pyflex.init(self.dataset_config["headless"])
+        with pyflex_lock:
+            if not pyflex_initialized:
+                try:
+                    pyflex.set_screenWidth(self.screenWidth)
+                    pyflex.set_screenHeight(self.screenHeight)
+                    pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
+                    pyflex.set_light_fov(70.0)
+                    pyflex.init(self.dataset_config["headless"])
+                    pyflex_initialized = True
+                    pyflex_config = {
+                        'screenWidth': self.screenWidth,
+                        'screenHeight': self.screenHeight,
+                        'headless': self.dataset_config["headless"]
+                    }
+                    print(f"Pyflex init done (singleton, env {self.env_id})")
+                except Exception as e:
+                    print(f"PyFlex initialization failed: {e}")
+                    raise
+            else:
+                # Verify config matches
+                if (pyflex_config['screenWidth'] != self.screenWidth or 
+                    pyflex_config['screenHeight'] != self.screenHeight or
+                    pyflex_config['headless'] != self.dataset_config["headless"]):
+                    print(f"Warning: PyFlex config mismatch for env {self.env_id}")
+                print(f"Pyflex already initialized (env {self.env_id})")
 
         # set up camera
         self.camera_view = self.dataset_config["camera_view"]
@@ -74,7 +106,7 @@ class FlexEnv(gym.Env):
         # others
         self.gripper = self.dataset_config["gripper"]
         self.stick_len = self.dataset_config["pusher_len"]
-    
+
         self.scene.set_scene(self.obj, self.obj_params)
         # set camera
         self.camera.set_init_camera(self.camera_view)
@@ -536,7 +568,21 @@ class FlexEnv(gym.Env):
             return pyflex.render(render_depth=True).reshape(self.screenHeight, self.screenWidth, 5)
 
     def close(self):
-        pyflex.clean()
+        global pyflex_env_count, pyflex_initialized, pyflex_config
+        
+        with pyflex_lock:
+            pyflex_env_count -= 1
+            print(f"Closing PyFlex environment {self.env_id}, {pyflex_env_count} remaining")
+            
+            # Only clean up PyFlex when the last environment is closed
+            if pyflex_env_count == 0 and pyflex_initialized:
+                try:
+                    pyflex.clean()
+                    pyflex_initialized = False
+                    pyflex_config = None
+                    print("PyFlex cleaned up (all environments closed)")
+                except Exception as e:
+                    print(f"PyFlex cleanup failed: {e}")
 
     def sample_action(self, init=False, boundary_points=None, boundary=None):
         if self.obj in ["rope", "granular"]:

@@ -68,6 +68,8 @@ class Trainer:
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
+        self.global_step = 0
+        self.log_every_steps = getattr(self.cfg.training, "log_every_steps", 0)
 
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
             "Batch size must be divisible by the number of processes. "
@@ -375,7 +377,7 @@ class Trainer:
             self.train()
             self.accelerator.wait_for_everyone()
             self.val()
-            self.logs_flash(step=self.epoch)
+            self.logs_flash(step=self.epoch, mode="epoch_end")
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
                 ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
@@ -534,6 +536,12 @@ class Trainer:
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
+            # per-step logging
+            self.global_step += 1
+            if self.log_every_steps and (self.global_step % self.log_every_steps == 0):
+                if self.accelerator.is_main_process:
+                    self.logs_flash(step=self.epoch, mode="train")
+
     def val(self):
         self.model.eval()
         if len(self.train_traj_dset) > 0 and self.cfg.has_predictor:
@@ -630,6 +638,12 @@ class Trainer:
                 )
             loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
+
+            # per-step logging
+            self.global_step += 1
+            if self.log_every_steps and (self.global_step % self.log_every_steps == 0):
+                if self.accelerator.is_main_process:
+                    self.logs_flash(step=self.epoch, mode="val")
 
     def openloop_rollout(
         self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
@@ -732,15 +746,22 @@ class Trainer:
                 total + sum(value),
             )
 
-    def logs_flash(self, step):
+    def logs_flash(self, step, mode="train"):
         epoch_log = OrderedDict()
         for key, value in self.epoch_log.items():
             count, sum = value
             to_log = sum / count
             epoch_log[key] = to_log
         epoch_log["epoch"] = step
-        log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
-                Validation loss: {epoch_log['val_loss']:.4f}")
+        epoch_log["global_step"] = self.global_step
+
+        # if mode == "epoch_end":
+        #     log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
+        #             Validation loss: {epoch_log['val_loss']:.4f}")
+        if mode == "train":
+            log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}")
+        elif mode == "val":
+            log.info(f"Epoch {self.epoch}  Validation loss: {epoch_log['val_loss']:.4f}")
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(epoch_log)

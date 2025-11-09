@@ -40,6 +40,7 @@ training:
   decoder_lr: 3e-4
   predictor_lr: 5e-4
   action_encoder_lr: 5e-4
+  log_every_steps: 100
 
 img_size: 224 # should be a multiple of 224
 frameskip: 5
