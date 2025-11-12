@@ -1,5 +1,6 @@
 import os
 import torch
+from torch import nn
 import random
 import argparse
 import numpy as np
@@ -91,3 +92,53 @@ def pil_loader(path):
     with open(path, "rb") as f:
         with Image.open(f) as img:
             return img.convert("RGB")
+
+def clear_cache():
+    torch.cuda.empty_cache()
+
+def has_layer_norm(model):
+    return any(isinstance(module, nn.LayerNorm) for _, module in model.named_modules())
+
+def init_wandb_watch(wandb_logger, model_trainer, wandb_watch_log_freq):
+    if not has_layer_norm(model_trainer.model):
+        wandb_logger.watch(model_trainer.model, log="all", log_freq = wandb_watch_log_freq)
+    
+    else: # all of complex below code is to get around the issue where wandb watch with layer norm has 'AttributeError: 'NoneType' object has no attribute 'data'' when logging gradients...
+        non_layernorm_container = nn.Module()
+        layernorm_container = nn.Module()
+
+        non_ln_modules = {}
+        ln_modules = {}
+
+        for name, module in model_trainer.model.named_modules():
+            if name == "": # skips top level model
+                continue
+            safe_name = name.replace(".", "_") # model cant contain '.' in name
+
+            if isinstance(module, nn.LayerNorm):
+                ln_modules[safe_name] = module
+            else:
+                # Only add modules that don't contain LayerNorm as submodules
+                has_ln_child = any(isinstance(child, nn.LayerNorm) 
+                                for child in module.modules())
+                if not has_ln_child:
+                    non_ln_modules[safe_name] = module
+
+        for name, module in non_ln_modules.items():
+            non_layernorm_container.add_module(name, module)
+
+        for name, module in ln_modules.items():
+            layernorm_container.add_module(name, module)
+
+        # print("\nNon-LayerNorm modules:")
+        # for name, _ in non_layernorm_container.named_modules():
+        #     if name != "":  # Skip the container itself
+        #         print(f"  - {name}")
+
+        # print("\nLayerNorm modules:")
+        # for name, _ in layernorm_container.named_modules():
+        #     if name != "":  # Skip the container itself
+        #         print(f"  - {name}")
+
+        wandb_logger.watch(non_layernorm_container, log="all", log_freq=wandb_watch_log_freq)
+        wandb_logger.watch(layernorm_container, log="parameters", log_freq=wandb_watch_log_freq)

@@ -18,99 +18,80 @@ from pathlib import Path
 from collections import OrderedDict
 from hydra.types import RunMode
 from hydra.core.hydra_config import HydraConfig
-from datetime import timedelta, datetime
+from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
 
-# Setup logging format
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-
 class Trainer:
     def __init__(self, cfg):
-        print("=" * 80)
-        print("INITIALIZING TRAINER")
-        print("=" * 80)
-        
         self.cfg = cfg
         with open_dict(cfg):
             cfg["saved_folder"] = os.getcwd()
+            log.info(f"Model saved dir: {cfg['saved_folder']}")
         cfg_dict = cfg_to_dict(cfg)
         model_name = cfg_dict["saved_folder"].split("outputs/")[-1]
         model_name += f"_{self.cfg.env.name}_f{self.cfg.frameskip}_h{self.cfg.num_hist}_p{self.cfg.num_pred}"
+        no_wandb = cfg_dict["no_wandb"]
+        is_slurm_run = cfg_dict["is_slurm_run"]
+        debug = cfg_dict["debug"]
+        log.info(f"Model name: {model_name}")
+        log.info(f"Debug: {debug}")
 
-        # Log initialization info
-        print(f"Model saved directory: {cfg['saved_folder']}")
-        print(f"Model name: {model_name}")
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print(f"CUDA device count: {torch.cuda.device_count()}")
-            print(f"Current CUDA device: {torch.cuda.current_device()}")
-            print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-        
-        # Debug mode handling
-        if getattr(self.cfg, "debug", False):
-            print("=" * 80)
-            print("WARNING: Running in DEBUG MODE")
-            print("=" * 80)
+        if self.cfg.training.seed is not None:
+            seed(self.cfg.training.seed)
+        else:
+            seed(42)   # default seed
 
-        if HydraConfig.get().mode == RunMode.MULTIRUN:
-            print("=" * 80)
-            print("MULTIRUN SETUP (SLURM)")
-            print("=" * 80)
-            print(f"SLURM_JOB_NODELIST: {os.environ.get('SLURM_JOB_NODELIST', 'N/A')}")
-            print(f"SLURM_JOBID: {os.environ.get('SLURM_JOBID', 'N/A')}")
-            print(f"SLURM_NTASKS: {os.environ.get('SLURM_NTASKS', 'N/A')}")
-            print(f"SLURM_GPUS_PER_NODE: {os.environ.get('SLURM_GPUS_PER_NODE', 'N/A')}")
-            print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'N/A')}")
-            if 'DEBUGVAR' in os.environ:
-                print(f"DEBUGVAR: {os.environ['DEBUGVAR']}")
-            
-            # ==== init ddp process group ====
-            os.environ["RANK"] = os.environ["SLURM_PROCID"]
-            os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
-            os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
-            try:
-                print("Initializing DDP process group...")
-                dist.init_process_group(
-                    backend="nccl",
-                    init_method="env://",
-                    timeout=timedelta(minutes=5),  # Set a 5-minute timeout
-                )
-                print(" DDP setup completed successfully")
-            except Exception as e:
-                print(f" DDP setup failed: {e}")
-                raise
-            torch.distributed.barrier()
-            print("=" * 80)
-            # # ==== /init ddp process group ====
+        if cfg_dict["debug"]:
+            log.info("WARNING: Running in debug mode...")
+            is_slurm_run = False
+            no_wandb = True
 
-        print("=" * 80)
-        print("INITIALIZING ACCELERATOR")
-        print("=" * 80)
+        if is_slurm_run:
+            if HydraConfig.get().mode == RunMode.MULTIRUN:
+                log.info(" Multirun setup begin...")
+                log.info(f"SLURM_JOB_NODELIST={os.environ['SLURM_JOB_NODELIST']}")
+                log.info(f"DEBUGVAR={os.environ['DEBUGVAR']}")
+                # ==== init ddp process group ====
+                os.environ["RANK"] = os.environ["SLURM_PROCID"]
+                os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
+                os.environ["LOCAL_RANK"] = os.environ["SLURM_LOCALID"]
+                try:
+                    dist.init_process_group(
+                        backend="nccl",
+                        init_method="env://",
+                        timeout=timedelta(minutes=5),  # Set a 5-minute timeout
+                    )
+                    log.info("Multirun setup completed.")
+                except Exception as e:
+                    log.error(f"DDP setup failed: {e}")
+                    raise
+                torch.distributed.barrier()
+                # # ==== /init ddp process group ====
+
         self.accelerator = Accelerator(log_with="wandb")
-        print(f"Process rank: {self.accelerator.local_process_index}")
-        print(f"Number of processes: {self.accelerator.num_processes}")
-        print(f"Is main process: {self.accelerator.is_main_process}")
+        log.info(
+            f"rank: {self.accelerator.local_process_index}  model_name: {model_name}"
+        )
         self.device = self.accelerator.device
-        print(f"Device: {self.device}")
+        log.info(f"device: {self.device}   model_name: {model_name}")
         self.base_path = os.path.dirname(os.path.abspath(__file__))
 
+        assert self.cfg.training.num_reconstruct_samples > 0, "num_reconstruct_samples must be greater than 0"
+        assert self.cfg.training.epochs > 0, "epochs must be greater than 0"
+        assert self.cfg.log_every_steps > 0, "log_every_steps must be greater than 0"
+        assert self.cfg.training.batch_size > 0, "batch_size must be greater than 0"
         self.num_reconstruct_samples = self.cfg.training.num_reconstruct_samples
         self.total_epochs = self.cfg.training.epochs
         self.epoch = 0
         self.global_step = 0
         self.log_every_steps = getattr(self.cfg.training, "log_every_steps", 0)
 
-        # Batch size validation
         assert cfg.training.batch_size % self.accelerator.num_processes == 0, (
             "Batch size must be divisible by the number of processes. "
             f"Batch_size: {cfg.training.batch_size} num_processes: {self.accelerator.num_processes}."
@@ -120,83 +101,29 @@ class Trainer:
         cfg.effective_batch_size = cfg.training.batch_size
         cfg.gpu_batch_size = cfg.training.batch_size // self.accelerator.num_processes
         OmegaConf.set_struct(cfg, True)
-        
-        print(f"Total batch size: {cfg.effective_batch_size}")
-        print(f"Batch size per GPU: {cfg.gpu_batch_size}")
-        print(f"Number of GPUs: {self.accelerator.num_processes}")
-        print(f"Effective batch size: {cfg.effective_batch_size}")
 
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
-            print("=" * 80)
-            print("INITIALIZING WANDB")
-            print("=" * 80)
             wandb_run_id = None
             if os.path.exists("hydra.yaml"):
                 existing_cfg = OmegaConf.load("hydra.yaml")
-                wandb_run_id = existing_cfg.get("wandb_run_id", None)
-                if wandb_run_id:
-                    print(f"Resuming WandB run: {wandb_run_id}")
+                wandb_run_id = existing_cfg["wandb_run_id"]
+                log.info(f"Resuming Wandb run {wandb_run_id}")
 
             wandb_dict = OmegaConf.to_container(cfg, resolve=True)
-            if getattr(self.cfg, "debug", False):
-                print("Initializing WandB in DEBUG project...")
-                self.wandb_run = wandb.init(
-                    project="dino_wm_debug",
-                    config=wandb_dict,
-                    id=wandb_run_id,
-                    resume="allow",
-                )
+            if self.cfg.debug:
+                log.info("WARNING: Running in debug mode...")
+                self.wandb_run = wandb.init(project="dino_wm_debug", config=wandb_dict, id=wandb_run_id, resume="allow")
             else:
-                print("Initializing WandB...")
-                self.wandb_run = wandb.init(
-                    project="dino_wm",
-                    config=wandb_dict,
-                    id=wandb_run_id,
-                    resume="allow",
-                )
+                self.wandb_run = wandb.init(project="dino_wm", config=wandb_dict, id=wandb_run_id, resume="allow")
             OmegaConf.set_struct(cfg, False)
             cfg.wandb_run_id = self.wandb_run.id
             OmegaConf.set_struct(cfg, True)
             wandb.run.name = "{}".format(model_name)
-            print(f"WandB run name: {model_name}")
-            print(f"WandB run ID: {self.wandb_run.id}")
             with open(os.path.join(os.getcwd(), "hydra.yaml"), "w") as f:
                 f.write(OmegaConf.to_yaml(cfg, resolve=True))
-            print(" WandB initialized successfully")
-            
-            # Log initial configuration and hardware info to WandB
-            self.wandb_run.log({
-                "config/num_hist": self.cfg.num_hist,
-                "config/num_pred": self.cfg.num_pred,
-                "config/frameskip": self.cfg.frameskip,
-                "config/env_name": self.cfg.env.name,
-                "config/training_epochs": self.cfg.training.epochs,
-                "config/training_batch_size": self.cfg.training.batch_size,
-                "config/encoder_lr": self.cfg.training.encoder_lr,
-                "config/predictor_lr": getattr(self.cfg.training, "predictor_lr", 0),
-                "config/decoder_lr": getattr(self.cfg.training, "decoder_lr", 0),
-                "config/action_encoder_lr": getattr(self.cfg.training, "action_encoder_lr", 0),
-                "hardware/num_processes": self.accelerator.num_processes,
-                "hardware/device": str(self.device),
-                "hardware/cuda_available": torch.cuda.is_available(),
-                "hardware/cuda_device_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-                "hardware/effective_batch_size": self.cfg.effective_batch_size,
-                "hardware/batch_size_per_gpu": self.cfg.gpu_batch_size,
-            })
 
-        # Set random seed
-        seed(cfg.training.seed)
-        print(f"Random seed set to: {cfg.training.seed}")
-        
-        print("=" * 80)
-        print("LOADING DATASETS")
-        print("=" * 80)
-        print(f"Dataset path: {self.cfg.env.dataset.data_path}")
-        print(f"Number of history frames: {self.cfg.num_hist}")
-        print(f"Number of prediction frames: {self.cfg.num_pred}")
-        print(f"Frameskip: {self.cfg.frameskip}")
-        
+        log.info(f"Loading dataset from {self.cfg.env.dataset.data_path} ...")
         self.datasets, traj_dsets = hydra.utils.call(
             self.cfg.env.dataset,
             num_hist=self.cfg.num_hist,
@@ -206,20 +133,6 @@ class Trainer:
 
         self.train_traj_dset = traj_dsets["train"]
         self.val_traj_dset = traj_dsets["valid"]
-        
-        print(f"Train dataset size: {len(self.datasets['train'])}")
-        print(f"Validation dataset size: {len(self.datasets['valid'])}")
-        print(f"Train trajectory dataset size: {len(self.train_traj_dset)}")
-        print(f"Validation trajectory dataset size: {len(self.val_traj_dset)}")
-        
-        # Log dataset info to WandB
-        if self.accelerator.is_main_process:
-            self.wandb_run.log({
-                "dataset/train_size": len(self.datasets['train']),
-                "dataset/val_size": len(self.datasets['valid']),
-                "dataset/train_traj_size": len(self.train_traj_dset),
-                "dataset/val_traj_size": len(self.val_traj_dset),
-            })
 
         self.dataloaders = {
             x: torch.utils.data.DataLoader(
@@ -232,14 +145,11 @@ class Trainer:
             for x in ["train", "valid"]
         }
 
-        print(f"Dataloader batch size per GPU: {self.cfg.gpu_batch_size}")
-        print(f"Number of workers per GPU: {self.cfg.env.num_workers}")
-        print(f"Total workers: {self.cfg.env.num_workers * self.accelerator.num_processes}")
+        log.info(f"dataloader batch size: {self.cfg.gpu_batch_size}")
 
         self.dataloaders["train"], self.dataloaders["valid"] = self.accelerator.prepare(
             self.dataloaders["train"], self.dataloaders["valid"]
         )
-        print(" Dataloaders prepared")
 
         self.encoder = None
         self.action_encoder = None
@@ -249,15 +159,10 @@ class Trainer:
         self.train_encoder = self.cfg.model.train_encoder
         self.train_predictor = self.cfg.model.train_predictor
         self.train_decoder = self.cfg.model.train_decoder
-        
-        print("=" * 80)
-        print("MODEL TRAINING FLAGS")
-        print("=" * 80)
-        print(f"Train encoder: {self.train_encoder}")
-        print(f"Train predictor: {self.train_predictor}")
-        print(f"Train decoder: {self.train_decoder}")
-        print(f"Has predictor: {self.cfg.has_predictor}")
-        print(f"Has decoder: {self.cfg.has_decoder}")
+        log.info(f"Train encoder, predictor, decoder:\
+            {self.cfg.model.train_encoder}\
+            {self.cfg.model.train_predictor}\
+            {self.cfg.model.train_decoder}")
 
         self._keys_to_save = [
             "epoch",
@@ -275,194 +180,26 @@ class Trainer:
         )
         self._keys_to_save += ["action_encoder", "proprio_encoder"]
 
-        print("=" * 80)
-        print("INITIALIZING MODELS")
-        print("=" * 80)
         self.init_models()
-        
-        print("=" * 80)
-        print("INITIALIZING OPTIMIZERS")
-        print("=" * 80)
         self.init_optimizers()
-        
-        # Log non-trainable parameters
-        print("=" * 80)
-        print("MODEL PARAMETER SUMMARY")
-        print("=" * 80)
-        total_params = 0
-        trainable_params = 0
-        for name, param in self.model.named_parameters():
-            total_params += param.numel()
-            if param.requires_grad:
-                trainable_params += param.numel()
-            else:
-                print(f"Non-trainable: {name} (shape: {param.shape})")
-        print(f"Total parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")
-        print(f"Non-trainable parameters: {total_params - trainable_params:,}")
-        
-        # Log model info to WandB
-        if self.accelerator.is_main_process:
-            self.wandb_run.log({
-                "model/total_parameters": total_params,
-                "model/trainable_parameters": trainable_params,
-                "model/non_trainable_parameters": total_params - trainable_params,
-                "model/train_encoder": self.train_encoder,
-                "model/train_predictor": self.train_predictor,
-                "model/train_decoder": self.train_decoder,
-                "model/has_predictor": self.cfg.has_predictor,
-                "model/has_decoder": self.cfg.has_decoder,
-            })
-        
-        self.epoch_log = OrderedDict()
-        
-        
-        # Gradient Accumulation
-        # Useful for simulating larger batch sizes when memory is limited
-        # Uncomment the following lines to enable:
-        # self.accumulate_grad_batches = getattr(self.cfg.training, "accumulate_grad_batches", 1)
-        # self.accumulation_step = 0
-        # if self.accumulate_grad_batches > 1:
-        #     print(f"Gradient accumulation enabled: {self.accumulate_grad_batches} batches")
-        
-        # Gradient Clipping
-        # Helps with training stability by preventing exploding gradients
-        # Uncomment the following lines to enable:
-        # self.gradient_clip_val = getattr(self.cfg.training, "gradient_clip_val", 0.0)
-        # if self.gradient_clip_val > 0:
-        #     print(f"Gradient clipping enabled: max_norm={self.gradient_clip_val}")
-        
-        # Learning Rate Scheduling
-        # Automatically adjusts learning rate during training
-        # Uncomment the following lines in init_optimizers() after creating optimizers:
-        # from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-        # self.schedulers = {}
-        # if self.train_encoder:
-        #     self.schedulers['encoder'] = CosineAnnealingLR(
-        #         self.encoder_optimizer,
-        #         T_max=self.total_epochs,
-        #         eta_min=getattr(self.cfg.training, "min_lr", 0)
-        #     )
-        # # Add similar for other optimizers...
-        # # Then in run(), after each epoch:
-        # # for name, scheduler in self.schedulers.items():
-        # #     scheduler.step()
-        # #     if self.accelerator.is_main_process:
-        # #         self.wandb_run.log({f"lr/{name}": scheduler.get_last_lr()[0]})
-        
-        # Early Stopping
-        # Stops training if validation loss doesn't improve for N epochs
-        # Uncomment the following lines to enable:
-        # self.early_stop_patience = getattr(self.cfg.training, "early_stop_patience", 0)
-        # self.best_val_loss = float('inf')
-        # self.patience_counter = 0
-        # if self.early_stop_patience > 0:
-        #     print(f"Early stopping enabled: patience={self.early_stop_patience} epochs")
-        
-        # Mixed Precision Training
-        # self.use_amp = getattr(self.cfg.training, "use_amp", False)
-        # if self.use_amp:
-        #     self.scaler = torch.cuda.amp.GradScaler()
-        #     print("Mixed precision training (AMP) enabled")
-        
-        # Best Model Tracking
-        self.best_val_loss = float('inf')
-        self.keep_top_k_checkpoints = getattr(self.cfg.training, "keep_top_k_checkpoints", 5)
-        self.checkpoint_history = []
-        print(f"Best model tracking enabled (keeping top {self.keep_top_k_checkpoints} checkpoints)")
-        
-        # Memory Management
-        self.memory_cleanup_interval = getattr(self.cfg.training, "memory_cleanup_interval", 100)
-        if self.memory_cleanup_interval > 0:
-            print(f"Memory cleanup enabled: every {self.memory_cleanup_interval} batches")
-        
-        # Configurable Validation Frequency
-        self.val_every_n_epochs = getattr(self.cfg.training, "val_every_n_epochs", 1)
-        if self.val_every_n_epochs > 1:
-            print(f"Validation frequency: every {self.val_every_n_epochs} epochs")
-        
-        # Error Handling & Recovery
-        self.skip_bad_batches = getattr(self.cfg.training, "skip_bad_batches", False)
-        if self.skip_bad_batches:
-            print("Bad batch skipping enabled (will skip batches that cause errors)")
-        
-        # Training Progress Callbacks (placeholder for extensibility)
-        self.callbacks = []
-        
-        # Automatic Best Model Loading (will be used at end of training)
-        self.load_best_at_end = getattr(self.cfg.training, "load_best_at_end", True)
-        
-        # Training State Tracking
-        self.training_state = {
-            "epoch": 0,
-            "global_step": 0,
-            "best_val_loss": float('inf'),
-            "current_val_loss": float('inf'),
-        }
-        
-        print("=" * 80)
-        print("TRAINER INITIALIZATION COMPLETE")
-        print("=" * 80)
 
-    def save_ckpt(self, is_best=False):
+        self.epoch_log = OrderedDict()
+
+    def save_ckpt(self):
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             if not os.path.exists("checkpoints"):
                 os.makedirs("checkpoints")
-                print("Created checkpoints directory")
-            
-            print(f"Saving checkpoint at epoch {self.epoch}...")
             ckpt = {}
             for k in self._keys_to_save:
                 if hasattr(self.__dict__[k], "module"):
                     ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
                 else:
                     ckpt[k] = self.__dict__[k]
-            
-            # Add training state to checkpoint
-            ckpt['training_state'] = self.training_state
-            ckpt['best_val_loss'] = self.best_val_loss
-            
-            latest_path = "checkpoints/model_latest.pth"
-            epoch_path = f"checkpoints/model_{self.epoch}.pth"
-            
-            torch.save(ckpt, latest_path)
-            torch.save(ckpt, epoch_path)
-            
-            # Save best model if this is the best
-            if is_best:
-                best_path = "checkpoints/model_best.pth"
-                torch.save(ckpt, best_path)
-                print(f" Saved new best model (val_loss={self.best_val_loss:.6f})")
-            
-            print(f" Checkpoint saved:")
-            print(f"  - Latest: {latest_path}")
-            print(f"  - Epoch {self.epoch}: {epoch_path}")
-            if is_best:
-                print(f"  - Best: checkpoints/model_best.pth")
-            print(f"  - Saved to: {os.getcwd()}")
-            
-            # Clean up old checkpoints
-            self.checkpoint_history.append(epoch_path)
-            if len(self.checkpoint_history) > self.keep_top_k_checkpoints:
-                old_ckpt = self.checkpoint_history.pop(0)
-                if os.path.exists(old_ckpt) and "model_best" not in old_ckpt and "model_latest" not in old_ckpt:
-                    try:
-                        os.remove(old_ckpt)
-                        print(f"  - Removed old checkpoint: {old_ckpt}")
-                    except Exception as e:
-                        print(f"  - Warning: Could not remove {old_ckpt}: {e}")
-            
-            # Log checkpoint save to WandB
-            self.wandb_run.log({
-                "checkpoint/epoch": self.epoch,
-                "checkpoint/global_step": self.global_step,
-                "checkpoint/saved": True,
-                "checkpoint/is_best": is_best,
-                "checkpoint/best_val_loss": self.best_val_loss,
-            })
-            
-            ckpt_path = os.path.join(os.getcwd(), epoch_path)
+            torch.save(ckpt, "checkpoints/model_latest.pth")
+            torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
+            log.info("Saved model to {}".format(os.getcwd()))
+            ckpt_path = os.path.join(os.getcwd(), f"checkpoints/model_{self.epoch}.pth")
         else:
             ckpt_path = None
         model_name = self.cfg["saved_folder"].split("outputs/")[-1]
@@ -470,33 +207,18 @@ class Trainer:
         return ckpt_path, model_name, model_epoch
 
     def load_ckpt(self, filename="model_latest.pth"):
-        print(f"Loading checkpoint from: {filename}")
-        ckpt = torch.load(filename, map_location=self.device)
+        ckpt = torch.load(filename)
         for k, v in ckpt.items():
-            if k not in ['training_state', 'best_val_loss']:  # Handle these separately
-                self.__dict__[k] = v
-        
-        #  Restore training state if available
-        if 'training_state' in ckpt:
-            self.training_state = ckpt['training_state']
-            print(f"  Restored training state: epoch={self.training_state.get('epoch', 0)}")
-        if 'best_val_loss' in ckpt:
-            self.best_val_loss = ckpt['best_val_loss']
-            print(f"  Restored best val loss: {self.best_val_loss:.6f}")
-        
+            self.__dict__[k] = v
         not_in_ckpt = set(self._keys_to_save) - set(ckpt.keys())
         if len(not_in_ckpt):
-            print(f" Warning: Keys not found in checkpoint: {not_in_ckpt}")
-        else:
-            print(" Checkpoint loaded successfully")
+            log.warning("Keys not found in ckpt: %s", not_in_ckpt)
 
     def init_models(self):
         model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
-            print(f"Resuming training from epoch {self.epoch}")
-        else:
-            print("No checkpoint found, starting from scratch")
+            log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
 
         # initialize encoder
         if self.encoder is None:
@@ -570,7 +292,7 @@ class Trainer:
                         self.decoder = ckpt["decoder"]
                     else:
                         self.decoder = torch.load(decoder_path)
-                    print(f"Loaded decoder from {decoder_path}")
+                    log.info(f"Loaded decoder from {decoder_path}")
                 else:
                     self.decoder = hydra.utils.instantiate(
                         self.cfg.decoder,
@@ -582,9 +304,6 @@ class Trainer:
         self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
             self.encoder, self.predictor, self.decoder
         )
-        print(" Encoder, predictor, and decoder prepared with accelerator")
-        
-        print("Instantiating world model...")
         self.model = hydra.utils.instantiate(
             self.cfg.model,
             encoder=self.encoder,
@@ -598,22 +317,14 @@ class Trainer:
             num_action_repeat=self.cfg.num_action_repeat,
             num_proprio_repeat=self.cfg.num_proprio_repeat,
         )
-        print(" World model instantiated")
 
     def init_optimizers(self):
-        print("Initializing optimizers...")
-        
-        # Always create encoder optimizer (even if not training encoder)
-        print(f"  - Encoder optimizer: Adam (lr={self.cfg.training.encoder_lr})")
         self.encoder_optimizer = torch.optim.Adam(
             self.encoder.parameters(),
             lr=self.cfg.training.encoder_lr,
         )
         self.encoder_optimizer = self.accelerator.prepare(self.encoder_optimizer)
-        
         if self.cfg.has_predictor:
-            # Always create predictor optimizer (even if not training predictor)
-            print(f"  - Predictor optimizer: AdamW (lr={self.cfg.training.predictor_lr})")
             self.predictor_optimizer = torch.optim.AdamW(
                 self.predictor.parameters(),
                 lr=self.cfg.training.predictor_lr,
@@ -622,7 +333,6 @@ class Trainer:
                 self.predictor_optimizer
             )
 
-            print(f"  - Action/Proprio encoder optimizer: AdamW (lr={self.cfg.training.action_encoder_lr})")
             self.action_encoder_optimizer = torch.optim.AdamW(
                 itertools.chain(
                     self.action_encoder.parameters(), self.proprio_encoder.parameters()
@@ -634,43 +344,10 @@ class Trainer:
             )
 
         if self.cfg.has_decoder:
-            # Always create decoder optimizer (even if not training decoder)
-            print(f"  - Decoder optimizer: Adam (lr={self.cfg.training.decoder_lr})")
             self.decoder_optimizer = torch.optim.Adam(
                 self.decoder.parameters(), lr=self.cfg.training.decoder_lr
             )
             self.decoder_optimizer = self.accelerator.prepare(self.decoder_optimizer)
-        
-        # Learning Rate Scheduling (OPTIONAL - uncomment to enable)
-        # Uncomment the following block to enable learning rate scheduling:
-        # from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
-        # self.schedulers = {}
-        # if self.train_encoder:
-        #     self.schedulers['encoder'] = CosineAnnealingLR(
-        #         self.encoder_optimizer,
-        #         T_max=self.total_epochs,
-        #         eta_min=getattr(self.cfg.training, "min_lr", 0)
-        #     )
-        # if self.cfg.has_predictor and self.train_predictor:
-        #     self.schedulers['predictor'] = CosineAnnealingLR(
-        #         self.predictor_optimizer,
-        #         T_max=self.total_epochs,
-        #         eta_min=getattr(self.cfg.training, "min_lr", 0)
-        #     )
-        # if self.cfg.has_decoder and self.train_decoder:
-        #     self.schedulers['decoder'] = CosineAnnealingLR(
-        #         self.decoder_optimizer,
-        #         T_max=self.total_epochs,
-        #         eta_min=getattr(self.cfg.training, "min_lr", 0)
-        #     )
-        # self.schedulers['action_encoder'] = CosineAnnealingLR(
-        #     self.action_encoder_optimizer,
-        #     T_max=self.total_epochs,
-        #     eta_min=getattr(self.cfg.training, "min_lr", 0)
-        # )
-        # print(" Learning rate schedulers initialized")
-        
-        print(" All optimizers initialized")
 
     def monitor_jobs(self, lock):
         """
@@ -693,25 +370,6 @@ class Trainer:
             time.sleep(1)
 
     def run(self):
-        print("=" * 80)
-        print("STARTING TRAINING")
-        print("=" * 80)
-        print(f"Total epochs: {self.total_epochs}")
-        print(f"Starting from epoch: {self.epoch + 1}")
-        print(f"Checkpoint save frequency: every {self.cfg.training.save_every_x_epoch} epochs")
-        print(f"Log every N steps: {self.log_every_steps if self.log_every_steps > 0 else 'disabled'}")
-        
-        # Log training start info to WandB
-        if self.accelerator.is_main_process:
-            self.wandb_run.log({
-                "training/total_epochs": self.total_epochs,
-                "training/starting_epoch": self.epoch + 1,
-                "training/checkpoint_frequency": self.cfg.training.save_every_x_epoch,
-                "training/log_every_steps": self.log_every_steps if self.log_every_steps > 0 else 0,
-                "training/effective_batch_size": self.cfg.effective_batch_size,
-                "training/batch_size_per_gpu": self.cfg.gpu_batch_size,
-            })
-        
         if self.accelerator.is_main_process:
             executor = ThreadPoolExecutor(max_workers=4)
             self.job_set = set()
@@ -721,114 +379,22 @@ class Trainer:
                 target=self.monitor_jobs, args=(lock,), daemon=True
             )
             self.monitor_thread.start()
-            print(" Planning job monitor thread started")
 
         init_epoch = self.epoch + 1  # epoch starts from 1
-        start_time = time.time()
-        
         for epoch in range(init_epoch, init_epoch + self.total_epochs):
             self.epoch = epoch
-            epoch_start_time = time.time()
-            
-            print("\n" + "=" * 80)
-            print(f"EPOCH {self.epoch}/{init_epoch + self.total_epochs - 1}")
-            print("=" * 80)
-            print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            
             self.accelerator.wait_for_everyone()
-            
-            # Callback on epoch start
-            for callback in self.callbacks:
-                if hasattr(callback, 'on_epoch_start'):
-                    callback.on_epoch_start(self.epoch)
-            
             self.train()
             self.accelerator.wait_for_everyone()
-            
-            # Configurable validation frequency
-            if self.epoch % self.val_every_n_epochs == 0:
-                self.val()
-                self.logs_flash(step=self.epoch, mode="epoch_end")
-            else:
-                print(f"Skipping validation (runs every {self.val_every_n_epochs} epochs)")
-            
-            # Update training state
-            self.training_state["epoch"] = self.epoch
-            self.training_state["global_step"] = self.global_step
-            if 'val_loss' in self.epoch_log:
-                self.training_state["current_val_loss"] = sum(self.epoch_log['val_loss'][1]) / self.epoch_log['val_loss'][0]
-            
-            # Callback on epoch end
-            for callback in self.callbacks:
-                if hasattr(callback, 'on_epoch_end'):
-                    callback.on_epoch_end(self.epoch, self.epoch_log)
-        
-            # Learning Rate Scheduling (OPTIONAL - uncomment if enabled)
-            # Uncomment the following block if LR scheduling is enabled:
-            # if hasattr(self, 'schedulers'):
-            #     for name, scheduler in self.schedulers.items():
-            #         scheduler.step()
-            #         if self.accelerator.is_main_process:
-            #             current_lr = scheduler.get_last_lr()[0]
-            #             self.wandb_run.log({f"lr/{name}": current_lr})
-            
-            # Early Stopping (OPTIONAL - uncomment to enable)
-            # Uncomment the following block to enable early stopping:
-            # if hasattr(self, 'early_stop_patience') and self.early_stop_patience > 0:
-            #     if 'val_loss' in self.epoch_log:
-            #         current_val_loss = sum(self.epoch_log['val_loss'][1]) / self.epoch_log['val_loss'][0]
-            #         if current_val_loss < self.best_val_loss:
-            #             self.best_val_loss = current_val_loss
-            #             self.patience_counter = 0
-            #             print(f" New best validation loss: {self.best_val_loss:.6f}")
-            #         else:
-            #             self.patience_counter += 1
-            #             if self.patience_counter >= self.early_stop_patience:
-            #                 print(f"Early stopping triggered after {self.early_stop_patience} epochs without improvement")
-            #                 print(f"Best validation loss: {self.best_val_loss:.6f}")
-            #                 break
-            
-            epoch_time = time.time() - epoch_start_time
-            elapsed_time = time.time() - start_time
-            avg_time_per_epoch = elapsed_time / (epoch - init_epoch + 1)
-            remaining_epochs = (init_epoch + self.total_epochs - 1) - epoch
-            estimated_remaining = avg_time_per_epoch * remaining_epochs
-            
-            print(f"Epoch {self.epoch} completed in {epoch_time:.2f}s")
-            print(f"Average time per epoch: {avg_time_per_epoch:.2f}s")
-            print(f"Estimated remaining time: {estimated_remaining/3600:.2f} hours")
-            
-            # Log timing info to WandB
-            if self.accelerator.is_main_process:
-                self.wandb_run.log({
-                    "timing/epoch_time_seconds": epoch_time,
-                    "timing/avg_epoch_time_seconds": avg_time_per_epoch,
-                    "timing/elapsed_time_hours": elapsed_time / 3600,
-                    "timing/estimated_remaining_hours": estimated_remaining / 3600,
-                    "timing/epoch": self.epoch,
-                    "timing/progress_pct": (epoch - init_epoch + 1) / self.total_epochs * 100,
-                })
-            
-            # Check if this is the best model
-            is_best = False
-            if 'val_loss' in self.epoch_log:
-                current_val_loss = sum(self.epoch_log['val_loss'][1]) / self.epoch_log['val_loss'][0]
-                self.training_state["current_val_loss"] = current_val_loss
-                if current_val_loss < self.best_val_loss:
-                    self.best_val_loss = current_val_loss
-                    self.training_state["best_val_loss"] = self.best_val_loss
-                    is_best = True
-                    print(f" New best validation loss: {self.best_val_loss:.6f}")
-            
+            self.val()
+            self.logs_flash(step=self.epoch, mode="epoch_end")
             if self.epoch % self.cfg.training.save_every_x_epoch == 0:
-                ckpt_path, model_name, model_epoch = self.save_ckpt(is_best=is_best)
+                ckpt_path, model_name, model_epoch = self.save_ckpt()
                 # main thread only: launch planning jobs on the saved ckpt
                 if (
-                    hasattr(self.cfg, "plan_settings") and 
                     self.cfg.plan_settings.plan_cfg_path is not None
                     and ckpt_path is not None
                 ):  # ckpt_path is only not None for main process
-                    print("Launching planning evaluation jobs...")
                     from plan import build_plan_cfg_dicts, launch_plan_jobs
 
                     cfg_dicts = build_plan_cfg_dicts(
@@ -852,40 +418,6 @@ class Trainer:
                     )
                     with lock:
                         self.job_set.update(jobs)
-                    print(f" Launched {len(jobs)} planning evaluation jobs")
-        
-        total_time = time.time() - start_time
-        print("\n" + "=" * 80)
-        print("TRAINING COMPLETED")
-        print("=" * 80)
-        print(f"Total training time: {total_time/3600:.2f} hours")
-        print(f"Total epochs completed: {self.total_epochs}")
-        print(f"Best validation loss: {self.best_val_loss:.6f}")
-        print("=" * 80)
-        
-        # Load best model for final evaluation
-        if self.load_best_at_end and os.path.exists("checkpoints/model_best.pth"):
-            print("\n" + "=" * 80)
-            print("LOADING BEST MODEL FOR FINAL EVALUATION")
-            print("=" * 80)
-            self.load_ckpt("checkpoints/model_best.pth")
-            print("Running final validation with best model...")
-            self.val()
-            self.logs_flash(step=self.epoch, mode="epoch_end")
-            print("=" * 80)
-        
-        # Print final training state
-        self.print_training_state()
-        
-        # Log training completion to WandB
-        if self.accelerator.is_main_process:
-            self.wandb_run.log({
-                "training/completed": True,
-                "training/total_time_hours": total_time / 3600,
-                "training/total_epochs_completed": self.total_epochs,
-                "training/final_epoch": self.epoch,
-                "training/best_val_loss": self.best_val_loss,
-            })
 
     def err_eval_single(self, z_pred, z_tgt):
         logs = {}
@@ -920,159 +452,39 @@ class Trainer:
         return logs
 
     def train(self):
-        print(f"\n{'='*80}")
-        print(f"TRAINING - Epoch {self.epoch}")
-        print(f"{'='*80}")
-        self.model.train()
-        
-        total_batches = len(self.dataloaders["train"])
-        print(f"Total training batches: {total_batches}")
-        
         for i, data in enumerate(
-            tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train", 
-                 disable=not self.accelerator.is_main_process)
+            tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
             obs, act, state = data
             plot = i == 0  # only plot from the first batch
             self.model.train()
-            
-            # Error handling with recovery
-            try:
-                # Mixed precision training
-                if self.use_amp:
-                    with torch.cuda.amp.autocast():
-                        z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                            obs, act
-                        )
-                else:
-                    z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                        obs, act
-                    )
-            except RuntimeError as e:
-                if "out of memory" in str(e) and self.skip_bad_batches:
-                    print(f" OOM error at batch {i}, skipping batch and clearing cache...")
-                    torch.cuda.empty_cache()
-                    import gc
-                    gc.collect()
-                    continue
-                else:
-                    raise
+            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                obs, act
+            )
 
-            # Gradient Accumulation (OPTIONAL - uncomment to enable)
-            # Uncomment the following block to enable gradient accumulation:
-            # if not hasattr(self, 'accumulate_grad_batches'):
-            #     self.accumulate_grad_batches = 1
-            #     self.accumulation_step = 0
-            # 
-            # self.accumulation_step += 1
-            # scaled_loss = loss / self.accumulate_grad_batches
-
-            # Zero gradients
-            if self.model.train_encoder:
-                self.encoder_optimizer.zero_grad()
-            if self.cfg.has_decoder and self.model.train_decoder:
+            self.encoder_optimizer.zero_grad()
+            if self.cfg.has_decoder:
                 self.decoder_optimizer.zero_grad()
-            if self.cfg.has_predictor and self.model.train_predictor:
+            if self.cfg.has_predictor:
                 self.predictor_optimizer.zero_grad()
                 self.action_encoder_optimizer.zero_grad()
 
-            # Backward pass
-            # Use scaled_loss if gradient accumulation is enabled
-            # if hasattr(self, 'accumulate_grad_batches') and self.accumulate_grad_batches > 1:
-            #     backward_loss = scaled_loss
-            # else:
-            backward_loss = loss
-            
-            # Mixed precision backward
-            if self.use_amp:
-                self.scaler.scale(backward_loss).backward()
-            else:
-                self.accelerator.backward(backward_loss)
+            self.accelerator.backward(loss)
 
-            # FEATURE 2: Gradient Clipping (OPTIONAL - uncomment to enable)
-            # Uncomment the following block to enable gradient clipping:
-            # if not hasattr(self, 'gradient_clip_val'):
-            #     self.gradient_clip_val = 0.0
-            # 
-            # if self.gradient_clip_val > 0:
-            #     if self.use_amp:
-            #         self.scaler.unscale_(self.encoder_optimizer)
-            #     if self.model.train_encoder:
-            #         torch.nn.utils.clip_grad_norm_(
-            #             self.encoder.parameters(), self.gradient_clip_val
-            #         )
-            #     if self.cfg.has_decoder and self.model.train_decoder:
-            #         torch.nn.utils.clip_grad_norm_(
-            #             self.decoder.parameters(), self.gradient_clip_val
-            #         )
-            #     if self.cfg.has_predictor and self.model.train_predictor:
-            #         torch.nn.utils.clip_grad_norm_(
-            #             self.predictor.parameters(), self.gradient_clip_val
-            #         )
-            #         torch.nn.utils.clip_grad_norm_(
-            #             list(self.action_encoder.parameters()) + list(self.proprio_encoder.parameters()),
-            #             self.gradient_clip_val
-            #         )
+            if self.model.train_encoder:
+                self.encoder_optimizer.step()
+            if self.cfg.has_decoder and self.model.train_decoder:
+                self.decoder_optimizer.step()
+            if self.cfg.has_predictor and self.model.train_predictor:
+                self.predictor_optimizer.step()
+                self.action_encoder_optimizer.step()
 
-            # Optimizer steps
-            # Only step when accumulation is complete
-            # if hasattr(self, 'accumulate_grad_batches') and self.accumulate_grad_batches > 1:
-            #     should_step = (self.accumulation_step % self.accumulate_grad_batches == 0)
-            # else:
-            should_step = True
-            
-            if should_step:
-                if self.use_amp:
-                    if self.model.train_encoder:
-                        self.scaler.step(self.encoder_optimizer)
-                    if self.cfg.has_decoder and self.model.train_decoder:
-                        self.scaler.step(self.decoder_optimizer)
-                    if self.cfg.has_predictor and self.model.train_predictor:
-                        self.scaler.step(self.predictor_optimizer)
-                        self.scaler.step(self.action_encoder_optimizer)
-                    self.scaler.update()
-                else:
-                    if self.model.train_encoder:
-                        self.encoder_optimizer.step()
-                    if self.cfg.has_decoder and self.model.train_decoder:
-                        self.decoder_optimizer.step()
-                    if self.cfg.has_predictor and self.model.train_predictor:
-                        self.predictor_optimizer.step()
-                        self.action_encoder_optimizer.step()
-                
-                # Reset accumulation step
-                # if hasattr(self, 'accumulate_grad_batches') and self.accumulate_grad_batches > 1:
-                #     if self.accumulation_step % self.accumulate_grad_batches == 0:
-                #         self.accumulation_step = 0
-
-            # Memory management
-            if i % self.memory_cleanup_interval == 0 and i > 0:
-                torch.cuda.empty_cache()
-                import gc
-                gc.collect()
-
-            # Gather metrics
             loss = self.accelerator.gather_for_metrics(loss).mean()
 
             loss_components = self.accelerator.gather_for_metrics(loss_components)
             loss_components = {
                 key: value.mean().item() for key, value in loss_components.items()
             }
-            
-            # Log first batch info
-            if i == 0 and self.accelerator.is_main_process:
-                print(f"\nFirst batch info:")
-                print(f"  Loss: {loss.item():.6f}")
-                print(f"  Loss components: {loss_components}")
-                # Log to WandB
-                wandb_log = {
-                    "train/first_batch_loss": loss.item(),
-                    "epoch": self.epoch,
-                    "global_step": self.global_step,
-                }
-                for k, v in loss_components.items():
-                    wandb_log[f"train/first_batch_{k}"] = v
-                self.wandb_run.log(wandb_log)
             if self.cfg.has_decoder and plot:
                 # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
@@ -1136,53 +548,13 @@ class Trainer:
 
             # per-step logging
             self.global_step += 1
-            
-            # Log to WandB more frequently (every N steps or every epoch)
-            if self.accelerator.is_main_process:
-                log_to_wandb = False
-                if self.log_every_steps > 0 and (self.global_step % self.log_every_steps == 0):
-                    log_to_wandb = True
-                elif i == len(self.dataloaders["train"]) - 1:  # Last batch of epoch
-                    log_to_wandb = True
-                elif i % max(1, len(self.dataloaders["train"]) // 10) == 0:  # Log ~10 times per epoch
-                    log_to_wandb = True
-                
-                if log_to_wandb:
-                    # Log current batch metrics
-                    step_log = {
-                        "train/step_loss": loss.item(),
-                        "epoch": self.epoch,
-                        "global_step": self.global_step,
-                        "train/batch": i,
-                        "train/total_batches": len(self.dataloaders["train"]),
-                    }
-                    for k, v in loss_components.items():
-                        step_log[f"train/step_{k}"] = v
-                    
-                    # Log learning rates
-                    if hasattr(self, 'encoder_optimizer') and self.encoder_optimizer is not None:
-                        step_log["train/lr_encoder"] = self.encoder_optimizer.param_groups[0]['lr']
-                    if hasattr(self, 'predictor_optimizer') and self.predictor_optimizer is not None:
-                        step_log["train/lr_predictor"] = self.predictor_optimizer.param_groups[0]['lr']
-                    if hasattr(self, 'decoder_optimizer') and self.decoder_optimizer is not None:
-                        step_log["train/lr_decoder"] = self.decoder_optimizer.param_groups[0]['lr']
-                    if hasattr(self, 'action_encoder_optimizer') and self.action_encoder_optimizer is not None:
-                        step_log["train/lr_action_encoder"] = self.action_encoder_optimizer.param_groups[0]['lr']
-                    
-                    self.wandb_run.log(step_log)
-                    
-                # Also do the regular logs_flash if configured
-                if self.log_every_steps and (self.global_step % self.log_every_steps == 0):
+            if self.log_every_steps and (self.global_step % self.log_every_steps == 0):
+                if self.accelerator.is_main_process:
                     self.logs_flash(step=self.epoch, mode="train")
 
     def val(self):
-        print(f"\n{'='*80}")
-        print(f"VALIDATION - Epoch {self.epoch}")
-        print(f"{'='*80}")
         self.model.eval()
-        
         if len(self.train_traj_dset) > 0 and self.cfg.has_predictor:
-            print("Running open-loop rollouts...")
             with torch.no_grad():
                 train_rollout_logs = self.openloop_rollout(
                     self.train_traj_dset, mode="train"
@@ -1196,27 +568,10 @@ class Trainer:
                     f"val_{k}": [v] for k, v in val_rollout_logs.items()
                 }
                 self.logs_update(val_rollout_logs)
-                
-                # Log rollout metrics to WandB immediately
-                if self.accelerator.is_main_process:
-                    rollout_wandb_log = {
-                        "epoch": self.epoch,
-                        "global_step": self.global_step,
-                    }
-                    for k, v in train_rollout_logs.items():
-                        rollout_wandb_log[f"rollout/{k}"] = v[0] if isinstance(v, list) else v
-                    for k, v in val_rollout_logs.items():
-                        rollout_wandb_log[f"rollout/{k}"] = v[0] if isinstance(v, list) else v
-                    self.wandb_run.log(rollout_wandb_log)
-            print(" Open-loop rollouts completed")
 
         self.accelerator.wait_for_everyone()
-        total_val_batches = len(self.dataloaders["valid"])
-        print(f"Total validation batches: {total_val_batches}")
-        
         for i, data in enumerate(
-            tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid",
-                 disable=not self.accelerator.is_main_process)
+            tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid")
         ):
             obs, act, state = data
             plot = i == 0
@@ -1294,23 +649,6 @@ class Trainer:
             loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
 
-            # Log validation metrics to WandB
-            if self.accelerator.is_main_process:
-                # Log current batch validation metrics
-                val_step_log = {
-                    "val/step_loss": loss.item(),
-                    "epoch": self.epoch,
-                    "global_step": self.global_step,
-                    "val/batch": i,
-                    "val/total_batches": len(self.dataloaders["valid"]),
-                }
-                for k, v in loss_components.items():
-                    val_step_log[f"val/step_{k}"] = v
-                
-                # Log every few batches or at the end
-                if i == 0 or i == len(self.dataloaders["valid"]) - 1 or i % max(1, len(self.dataloaders["valid"]) // 5) == 0:
-                    self.wandb_run.log(val_step_log)
-
             # per-step logging
             self.global_step += 1
             if self.log_every_steps and (self.global_step % self.log_every_steps == 0):
@@ -1320,7 +658,10 @@ class Trainer:
     def openloop_rollout(
         self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
     ):
-        np.random.seed(self.cfg.training.seed)
+        if self.cfg.training.seed is not None:
+            seed(self.cfg.training.seed)
+        else:
+            seed(42)   # default seed
         min_horizon = min_horizon + self.cfg.num_hist
         plotting_dir = f"rollout_plots/e{self.epoch}_rollout"
         if self.accelerator.is_main_process:
@@ -1329,6 +670,9 @@ class Trainer:
         logs = {}
 
         # rollout with both num_hist and 1 frame as context
+        assert self.cfg.num_hist > 0, "num_hist must be greater than 0"
+        assert self.cfg.frameskip >= 1, "frameskip must be greater than or equal to 1"
+        
         num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
 
         # sample traj
@@ -1427,27 +771,13 @@ class Trainer:
         epoch_log["epoch"] = step
         epoch_log["global_step"] = self.global_step
 
-        if mode == "epoch_end":
-            print(f"\n{'='*80}")
-            print(f"EPOCH {step} SUMMARY")
-            print(f"{'='*80}")
-            if 'train_loss' in epoch_log:
-                print(f"Training loss: {epoch_log['train_loss']:.6f}")
-            if 'val_loss' in epoch_log:
-                print(f"Validation loss: {epoch_log['val_loss']:.6f}")
-            
-            # Print other key metrics
-            for key, value in epoch_log.items():
-                if key not in ['epoch', 'global_step', 'train_loss', 'val_loss']:
-                    if isinstance(value, (int, float)):
-                        print(f"{key}: {value:.6f}")
-            print(f"{'='*80}\n")
-        elif mode == "train":
-            if 'train_loss' in epoch_log:
-                print(f"Step {self.global_step} - Training loss: {epoch_log['train_loss']:.6f}")
+        # if mode == "epoch_end":
+        #     log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}  \
+        #             Validation loss: {epoch_log['val_loss']:.4f}")
+        if mode == "train":
+            log.info(f"Epoch {self.epoch}  Training loss: {epoch_log['train_loss']:.4f}")
         elif mode == "val":
-            if 'val_loss' in epoch_log:
-                print(f"Step {self.global_step} - Validation loss: {epoch_log['val_loss']:.6f}")
+            log.info(f"Epoch {self.epoch}  Validation loss: {epoch_log['val_loss']:.4f}")
 
         if self.accelerator.is_main_process:
             self.wandb_run.log(epoch_log)
@@ -1519,66 +849,12 @@ class Trainer:
             normalize=True,
             value_range=(-1, 1),
         )
-    
-    def print_training_state(self):
-        """FEATURE 12: Print current training state for debugging"""
-        print("\n" + "=" * 80)
-        print("TRAINING STATE SUMMARY")
-        print("=" * 80)
-        print(f"  Epoch: {self.training_state['epoch']}/{self.total_epochs}")
-        print(f"  Global Step: {self.training_state['global_step']}")
-        print(f"  Best Val Loss: {self.training_state['best_val_loss']:.6f}")
-        print(f"  Current Val Loss: {self.training_state.get('current_val_loss', 'N/A')}")
-        
-        # Print current learning rates
-        lrs = {}
-        if hasattr(self, 'encoder_optimizer') and self.encoder_optimizer is not None:
-            lrs['encoder'] = self.encoder_optimizer.param_groups[0]['lr']
-        if hasattr(self, 'predictor_optimizer') and self.predictor_optimizer is not None:
-            lrs['predictor'] = self.predictor_optimizer.param_groups[0]['lr']
-        if hasattr(self, 'decoder_optimizer') and self.decoder_optimizer is not None:
-            lrs['decoder'] = self.decoder_optimizer.param_groups[0]['lr']
-        if hasattr(self, 'action_encoder_optimizer') and self.action_encoder_optimizer is not None:
-            lrs['action_encoder'] = self.action_encoder_optimizer.param_groups[0]['lr']
-        
-        if lrs:
-            print(f"  Current Learning Rates:")
-            for name, lr in lrs.items():
-                print(f"    {name}: {lr:.2e}")
-        
-        print("=" * 80)
 
 
 @hydra.main(config_path="conf", config_name="train")
 def main(cfg: OmegaConf):
-    print("\n" + "=" * 80)
-    print("DINO WORLD MODEL TRAINING")
-    print("=" * 80)
-    print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 80 + "\n")
-    
-    try:
-        trainer = Trainer(cfg)
-        trainer.run()
-        
-        print("\n" + "=" * 80)
-        print("TRAINING FINISHED SUCCESSFULLY")
-        print("=" * 80)
-        print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 80)
-        
-    except KeyboardInterrupt:
-        print("\n" + "=" * 80)
-        print("TRAINING INTERRUPTED BY USER")
-        print("=" * 80)
-        raise
-    except Exception as e:
-        print("\n" + "=" * 80)
-        print("TRAINING FAILED WITH ERROR")
-        print("=" * 80)
-        print(f"Error: {str(e)}")
-        print("=" * 80)
-        raise
+    trainer = Trainer(cfg)
+    trainer.run()
 
 
 if __name__ == "__main__":
