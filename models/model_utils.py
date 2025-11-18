@@ -7,7 +7,7 @@ from torchmetrics import Accuracy
 import traceback
 from torchvision.transforms import functional as TF
 import torchvision.models as models
-from diffusers import AutoencoderKL
+# from diffusers import AutoencoderKL
 import math
 import random
 import numpy as np
@@ -75,3 +75,93 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
+model_sizes = { # small -> xl same as mamba https://arxiv.org/pdf/2312.00752; all others estimated empirically. LRs based off mamba where applicable
+    "4xs": { # LR 0.0024 recommended
+        "num_transformer_blocks": 2,
+        "multiheaded_attention_heads": 2,
+        "embedding_dim": 128,
+    },
+    "3xs": { # LR 0.0018
+        "num_transformer_blocks": 4,
+        "multiheaded_attention_heads": 4,
+        "embedding_dim": 256,
+    },
+    "xxs": { # LR 0.0012
+        "num_transformer_blocks": 6,
+        "multiheaded_attention_heads": 6,
+        "embedding_dim": 384,
+    },
+    "2xs": { # LR 0.0012
+        "num_transformer_blocks": 6,
+        "multiheaded_attention_heads": 6,
+        "embedding_dim": 384,
+    },
+    "xs": { # LR 0.0009
+        "num_transformer_blocks": 12,
+        "multiheaded_attention_heads": 6,
+        "embedding_dim": 384,
+    },
+    "small": { # LR 0.0006
+        "num_transformer_blocks": 12,
+        "multiheaded_attention_heads": 12,
+        "embedding_dim": 768,
+    },
+    "medium": { # 0.0003
+        "num_transformer_blocks": 24,
+        "multiheaded_attention_heads": 16,
+        "embedding_dim": 1024,
+    },
+    "large": { # 0.00025
+        "num_transformer_blocks": 24,
+        "multiheaded_attention_heads": 16,
+        "embedding_dim": 1536,
+    },
+    "xl": { # 0.0002
+        "num_transformer_blocks": 24,
+        "multiheaded_attention_heads": 32,
+        "embedding_dim": 2048,
+    }
+}

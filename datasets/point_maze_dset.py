@@ -1,13 +1,13 @@
 import torch
-import decord
+# import decord
 import numpy as np
 from pathlib import Path
 from einops import rearrange
-from decord import VideoReader
+# from decord import VideoReader
 from typing import Callable, Optional
 from .traj_dset import TrajDataset, get_train_val_sliced
 from typing import Optional, Callable, Any
-decord.bridge.set_bridge("torch")
+# decord.bridge.set_bridge("torch")
 
 class PointMazeDataset(TrajDataset):
     def __init__(

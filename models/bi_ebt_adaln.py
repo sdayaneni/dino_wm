@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
+import pytorch_lightning as L
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from models.model_utils import *
 
@@ -98,8 +99,10 @@ class EBT(nn.Module): # similar to DiT but with no time embedder and gives singl
         if is_time_conditioned:
             self.t_embedder = TimestepEmbedder(hidden_size)
         num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        # For now, using learned positional encoding TODO: add sin/cos as well
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=True)
+        nn.init.xavier_uniform_(self.pos_embed.data) 
 
         self.blocks = nn.ModuleList([
             EBTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -117,13 +120,13 @@ class EBT(nn.Module): # similar to DiT but with no time embedder and gives singl
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        # pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5)) # TODO: implement later
+        # self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        # w = self.x_embedder.proj.weight.data
+        # nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        # nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Zero-out adaLN modulation layers in EBT blocks:
         for block in self.blocks:
@@ -141,7 +144,7 @@ class EBT(nn.Module): # similar to DiT but with no time embedder and gives singl
                     nn.init.constant_(m.bias, 0)
         # nn.init.constant_(self.final_layer.linear.bias, 0) # turned off bias for final output for ebm
 
-    def forward(self, x, y, t=None, return_patches = False): # optional time conditioning since is an EBT, return patches is for downstream models not using final layer etc
+    def forward(self, x, y, pos_embed, t=None, return_patches = False): # optional time conditioning since is an EBT, return patches is for downstream models not using final layer etc
         """
         Forward pass of EBT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -152,8 +155,12 @@ class EBT(nn.Module): # similar to DiT but with no time embedder and gives singl
             assert t is not None
         else:
             assert t is None
+        
+        # Removed patch embed
+        # x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
 
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = x + pos_embed
+
         c = y                                # (N, D)
 
         if t is not None:
