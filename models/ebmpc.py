@@ -135,7 +135,7 @@ class EBMPC(L.LightningModule):
             if torch.isnan(action_grad).any() or torch.isinf(action_grad).any():
                 raise ValueError("NaN or Inf gradients detected during MCMC.")
             
-            actions = (actions - alpha * action_grad).detach().requires_grad_(True)
+            actions = (actions - alpha * action_grad).requires_grad_(True)
         
         return actions, energy_history, action_grad_norms
     
@@ -149,6 +149,7 @@ class EBMPC(L.LightningModule):
         
         num_frames = obs['visual'].shape[1]
         num_proprio_frames = obs['proprio'].shape[1]
+
         max_valid = min(num_frames, num_proprio_frames)
 
         random_end_point = random.randint(num_hist, max_valid - 1)
@@ -156,6 +157,7 @@ class EBMPC(L.LightningModule):
         actions, energy_history, grad_norms = self(batch, random_end_point)
         
         gt_actions = act[:, :random_end_point, :]
+
         loss = self.loss_fn(actions, gt_actions)
         
         self.log('train_loss', loss, prog_bar=True, sync_dist=True, on_step=True, on_epoch=True)
